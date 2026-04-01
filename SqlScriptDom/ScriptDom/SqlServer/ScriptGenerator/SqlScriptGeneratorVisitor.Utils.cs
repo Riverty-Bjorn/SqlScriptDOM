@@ -108,7 +108,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             }
         }
 
-        // generate Name = value 
+        // generate Name = value
         protected void GenerateNameEqualsValue(String name, TSqlFragment value)
         {
             GenerateTokenAndEqualSign(name);
@@ -122,7 +122,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             GenerateSpaceAndIdentifier(value);
         }
 
-        // generate Name = value 
+        // generate Name = value
         protected void GenerateNameEqualsValue(TSqlTokenType keywordId, TSqlFragment value)
         {
             GenerateTokenAndEqualSign(keywordId);
@@ -244,7 +244,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
                 else if (generateSpaces)
                 {
                     GenerateSpace();
-                } 
+                }
             });
         }
 
@@ -402,7 +402,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         {
             GenerateAlignedParenthesizedOptionsWithMultipleIndent(list, 0);
         }
-        
+
         private void GenerateSeparator(ListGenerationOption option)
         {
             switch (option.Separator)
@@ -426,13 +426,13 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             }
         }
 
-        // generate a whitespace 
+        // generate a whitespace
         protected void GenerateSpace()
         {
             _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
         }
 
-        // generate a keyword 
+        // generate a keyword
         protected void GenerateKeyword(TSqlTokenType keywordId)
         {
             _writer.AddKeyword(keywordId);
@@ -473,7 +473,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             GenerateSymbol(symbolId);
         }
 
-        // generate a symbol and a white space 
+        // generate a symbol and a white space
         protected void GenerateSymbolAndSpace(TSqlTokenType symbolId)
         {
             GenerateSymbol(symbolId);
@@ -519,7 +519,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         }
 
         // generate a comma-separated list for a value of a flag enum
-        protected void GenerateCommaSeparatedFlagOpitons<TKey>(Dictionary<TKey, TokenGenerator> optionsGenerators, TKey options) 
+        protected void GenerateCommaSeparatedFlagOpitons<TKey>(Dictionary<TKey, TokenGenerator> optionsGenerators, TKey options)
             where TKey : struct, IConvertible
         {
             Boolean first = true;

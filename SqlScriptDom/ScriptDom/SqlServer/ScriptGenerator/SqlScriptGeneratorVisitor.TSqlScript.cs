@@ -18,21 +18,24 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
                 SetTokenStreamForComments(node.ScriptTokenStream);
             }
 
-            Boolean firstItem = true;
+            TSqlBatch prevBatch = null;
             foreach (var item in node.Batches)
             {
-                if (firstItem)
-                {
-                    firstItem = false;
-                }
-                else
+                if (prevBatch != null)
                 {
                     NewLine();
                     GenerateKeyword(TSqlTokenType.Go);
                     NewLine();
+
+                    if (_options.PreserveComments && _currentTokenStream != null)
+                    {
+                        int blanks = CountBlankLinesBetween(prevBatch.LastTokenIndex, item.FirstTokenIndex, mandatoryNewlines: 2);
+                        for (int b = 0; b < Math.Min(blanks, 3); b++) NewLine();
+                    }
                 }
 
                 GenerateFragmentIfNotNull(item);
+                prevBatch = item;
             }
 
             // Emit any remaining comments at end of script (after the last statement)

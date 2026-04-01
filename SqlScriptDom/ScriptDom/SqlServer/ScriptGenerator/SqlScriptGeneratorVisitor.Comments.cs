@@ -26,7 +26,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         /// <summary>
         /// Tracks which comment tokens have already been emitted to avoid duplicates.
         /// </summary>
-        private readonly HashSet<TSqlParserToken> _emittedComments = new HashSet<TSqlParserToken>();
+        private readonly HashSet<int> _emittedCommentIndexes = new HashSet<int>();
 
         /// <summary>
         /// Tracks whether leading (file-level) comments have been emitted.
@@ -46,7 +46,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         {
             _currentTokenStream = tokenStream;
             _lastProcessedTokenIndex = -1;
-            _emittedComments.Clear();
+            _emittedCommentIndexes.Clear();
             _leadingCommentsEmitted = false;
         }
 
@@ -70,10 +70,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             for (int i = 0; i < fragment.FirstTokenIndex && i < _currentTokenStream.Count; i++)
             {
                 var token = _currentTokenStream[i];
-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
+                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
                 {
                     EmitCommentToken(token, isLeading: true);
-                    _emittedComments.Add(token);
+                    _emittedCommentIndexes.Add(i);
+                    _lastProcessedTokenIndex = i;
                 }
             }
         }
@@ -101,10 +102,10 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             for (int i = startIndex; i < endIndex && i < _currentTokenStream.Count; i++)
             {
                 var token = _currentTokenStream[i];
-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
+                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
                 {
                     EmitCommentToken(token, isLeading: true);
-                    _emittedComments.Add(token);
+                    _emittedCommentIndexes.Add(i);
                     _lastProcessedTokenIndex = i;
                 }
             }
@@ -131,11 +132,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             for (int i = lastTokenIndex + 1; i < _currentTokenStream.Count; i++)
             {
                 var token = _currentTokenStream[i];
-                
-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
+
+                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
                 {
-                    EmitCommentToken(token, isLeading: false);
-                    _emittedComments.Add(token);
+                    EmitCommentToken(token, isLeading: ShouldEmitTrailingCommentAsLeading(lastTokenIndex + 1, i));
+                    _emittedCommentIndexes.Add(i);
                     _lastProcessedTokenIndex = i;
                 }
                 else if (token.TokenType != TSqlTokenType.WhiteSpace)
@@ -144,6 +145,63 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
                     break;
                 }
             }
+        }
+
+        private bool ShouldEmitTrailingCommentAsLeading(int startIndex, int commentIndex)
+        {
+            for (int i = startIndex; i < commentIndex && i < _currentTokenStream.Count; i++)
+            {
+                var token = _currentTokenStream[i];
+                if (token.TokenType == TSqlTokenType.WhiteSpace &&
+                    token.Text != null &&
+                    (token.Text.Contains("\r") || token.Text.Contains("\n")))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Counts blank lines in whitespace tokens between two token-stream positions,
+        /// skipping batch separators (semicolons, GO) and stopping at the first comment
+        /// or other real token. Returns the number of blank lines beyond the
+        /// <paramref name="mandatoryNewlines"/> the caller already emits unconditionally.
+        /// </summary>
+        /// <param name="startExclusive">Token index after which scanning begins (exclusive).</param>
+        /// <param name="endExclusive">Token index at which scanning stops (exclusive).</param>
+        /// <param name="mandatoryNewlines">
+        /// Newlines the caller will emit regardless (subtracted from the raw count).
+        /// Use 1 for statement boundaries; use 2 for inter-batch gaps where the caller
+        /// emits a newline before and after GO.
+        /// </param>
+        protected int CountBlankLinesBetween(int startExclusive, int endExclusive, int mandatoryNewlines = 1)
+        {
+            if (_currentTokenStream == null)
+                return 0;
+
+            int newlineCount = 0;
+            for (int i = startExclusive + 1; i < endExclusive && i < _currentTokenStream.Count; i++)
+            {
+                var token = _currentTokenStream[i];
+                if (token.TokenType == TSqlTokenType.WhiteSpace && token.Text != null)
+                {
+                    foreach (char c in token.Text)
+                        if (c == '\n') newlineCount++;
+                }
+                else if (token.TokenType == TSqlTokenType.Semicolon ||
+                         token.TokenType == TSqlTokenType.Go)
+                {
+                    continue; // skip batch separators
+                }
+                else
+                {
+                    break; // stop at first comment or real code token
+                }
+            }
+
+            return Math.Max(0, newlineCount - mandatoryNewlines);
         }
 
         /// <summary>
@@ -192,9 +250,30 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
                 return;
             }
 
+            if (fragment is TSqlStatement)
+            {
+                UpdateLastProcessedIndex(fragment);
+                return;
+            }
+
             // Emit trailing comments and update tracking
             EmitTrailingComments(fragment);
             UpdateLastProcessedIndex(fragment);
+        }
+
+        /// <summary>
+        /// Called after generating a statement terminator so trailing statement comments stay after it.
+        /// </summary>
+        /// <param name="statement">The statement that was just fully generated.</param>
+        protected void HandleCommentsAfterStatement(TSqlStatement statement)
+        {
+            if (!_options.PreserveComments || _currentTokenStream == null || statement == null)
+            {
+                return;
+            }
+
+            EmitTrailingComments(statement);
+            UpdateLastProcessedIndex(statement);
         }
 
         /// <summary>
@@ -209,35 +288,34 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
                 return;
             }
 
+            if (isLeading && _writer.IsAtLineStart == false)
+            {
+                _writer.NewLine();
+            }
+            else if (!isLeading && _writer.IsAtLineStart == false)
+            {
+                _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
+            }
+
             if (token.TokenType == TSqlTokenType.SingleLineComment)
             {
-                if (!isLeading)
-                {
-                    // Trailing: add space before comment
-                    _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
-                }
-
                 _writer.AddToken(new TSqlParserToken(TSqlTokenType.SingleLineComment, token.Text));
 
                 if (isLeading)
                 {
-                    // After a leading comment, add newline
                     _writer.NewLine();
+                }
+                else
+                {
+                    _writer.RequestLineBreakBeforeNextToken();
                 }
             }
             else if (token.TokenType == TSqlTokenType.MultilineComment)
             {
-                if (!isLeading)
-                {
-                    // Trailing: add space before comment
-                    _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
-                }
-
                 _writer.AddToken(new TSqlParserToken(TSqlTokenType.MultilineComment, token.Text));
 
                 if (isLeading)
                 {
-                    // After a leading multi-line comment, add newline
                     _writer.NewLine();
                 }
             }
@@ -259,12 +337,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             for (int i = _lastProcessedTokenIndex + 1; i < _currentTokenStream.Count; i++)
             {
                 var token = _currentTokenStream[i];
-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
+                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
                 {
-                    // End-of-script comments: add newline before, emit comment
-                    _writer.NewLine();
-                    _writer.AddToken(new TSqlParserToken(token.TokenType, token.Text));
-                    _emittedComments.Add(token);
+                    EmitCommentToken(token, isLeading: true);
+                    _emittedCommentIndexes.Add(i);
+                    _lastProcessedTokenIndex = i;
                 }
             }
         }

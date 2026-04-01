@@ -25,11 +25,19 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             MarkClauseBodyAlignmentWhenNecessary(_options.NewLineBeforeGroupByClause, clauseBody);
 
             GenerateSpace();
-            GenerateCommaSeparatedList(node.GroupingSpecifications);
+            PushAlignmentPoint(clauseBody);
+            try
+            {
+                GenerateCommaSeparatedList(node.GroupingSpecifications);
+            }
+            finally
+            {
+                PopAlignmentPoint();
+            }
 
             if (node.GroupByOption != GroupByOption.None)
             {
-                GenerateSpaceAndKeyword(TSqlTokenType.With); 
+                GenerateSpaceAndKeyword(TSqlTokenType.With);
                 GenerateSpace();
                 GroupByOptionHelper.Instance.GenerateSourceForOption(_writer, node.GroupByOption);
             }

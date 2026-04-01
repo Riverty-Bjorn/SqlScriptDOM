@@ -426,18 +426,24 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             get;
         }
 
-        // some statements can be part of another statment, for example, SELECT statement can be 
+        // some statements can be part of another statment, for example, SELECT statement can be
         // part of CREATE VIEW statement, and we don't want to generate semicolon for the included statements
         protected Boolean _generateSemiColon = true;
 
         protected void GenerateSemiColonWhenNecessary(TSqlStatement node)
         {
-            if (node != null &&
-                _generateSemiColon &&
+            if (node == null)
+            {
+                return;
+            }
+
+            if (_generateSemiColon &&
                 StatementsThatCannotHaveSemiColon.Contains(node.GetType()) == false)
             {
                 GenerateSymbol(TSqlTokenType.Semicolon);
             }
+
+            HandleCommentsAfterStatement(node);
         }
 
         protected void GenerateCommaSeparatedWithClause<T>(IList<T> fragments, bool indent, bool includeParentheses) where T : TSqlFragment

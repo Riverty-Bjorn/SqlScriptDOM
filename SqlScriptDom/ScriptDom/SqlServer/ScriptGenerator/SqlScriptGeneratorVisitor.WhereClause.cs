@@ -22,13 +22,30 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
 
             if (node.SearchCondition != null)
             {
-                GenerateSpaceAndFragmentIfNotNull(node.SearchCondition);
+                GenerateSpace();
+                PushAlignmentPoint(clauseBody);
+                try
+                {
+                    GenerateFragmentIfNotNull(node.SearchCondition);
+                }
+                finally
+                {
+                    PopAlignmentPoint();
+                }
             }
             else
             {
                 GenerateSpaceAndKeyword(TSqlTokenType.Current);
                 GenerateSpaceAndKeyword(TSqlTokenType.Of);
-                GenerateSpaceAndFragmentIfNotNull(node.Cursor);
+                PushAlignmentPoint(clauseBody);
+                try
+                {
+                    GenerateSpaceAndFragmentIfNotNull(node.Cursor);
+                }
+                finally
+                {
+                    PopAlignmentPoint();
+                }
             }
 
             PopAlignmentPoint();

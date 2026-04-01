@@ -14,19 +14,22 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         {
             if (node.Statements != null)
             {
-                Boolean first = true;
-                foreach (TSqlStatement statement in node.Statements)
+                for (int i = 0; i < node.Statements.Count; i++)
                 {
-                    if (first)
+                    TSqlStatement statement = node.Statements[i];
+                    if (i > 0)
                     {
-                        first = false;
-                    }
-                    else
-                    {
-                        for (var i = 0; i < _options.NumNewlinesAfterStatement; i++)
+                        int newlineCount;
+                        if (_options.PreserveComments && _currentTokenStream != null)
                         {
-                            NewLine();
+                            int blankLines = CountBlankLinesBetween(node.Statements[i - 1].LastTokenIndex, statement.FirstTokenIndex);
+                            newlineCount = 1 + Math.Min(blankLines, 3);
                         }
+                        else
+                        {
+                            newlineCount = _options.NumNewlinesAfterStatement;
+                        }
+                        for (int n = 0; n < newlineCount; n++) NewLine();
                     }
 
                     GenerateFragmentIfNotNull(statement);

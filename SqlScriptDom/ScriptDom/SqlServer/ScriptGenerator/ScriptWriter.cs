@@ -32,6 +32,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         private Stack<Dictionary<String, AlignmentPoint>> _alignmentPointNameMaps; // Name to AlignmentPoints for the alignment points found after the nearest push
         private List<ScriptWriterElement> _scriptWriterElements;
         private Stack<AlignmentPoint> _newLineAlignmentPoints;
+        private bool _pendingLineBreakBeforeNextToken;
 
         #endregion
 
@@ -73,11 +74,23 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         public void AddToken(TSqlParserToken token)
         {
             ScriptGeneratorSupporter.CheckForNullReference(token, "token");
+
+            if (_pendingLineBreakBeforeNextToken && token.TokenType != TSqlTokenType.WhiteSpace)
+            {
+                NewLine();
+            }
+
             AddTokenWrapper(new TokenWrapper(token));
+        }
+
+        public bool IsAtLineStart
+        {
+            get { return _isAtLineStart; }
         }
 
         public void NewLine()
         {
+            _pendingLineBreakBeforeNextToken = false;
             AddNewLine();
 
             // if we have some AlignmentPoints on stack, we set to the top one
@@ -90,6 +103,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         public void Indent(Int32 size)
         {
             AddSpace(size);
+        }
+
+        public void RequestLineBreakBeforeNextToken()
+        {
+            _pendingLineBreakBeforeNextToken = true;
         }
 
         public void Mark(AlignmentPoint ap)
@@ -185,6 +203,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         private void AddTokenWrapper(TokenWrapper token)
         {
             _scriptWriterElements.Add(token);
+
+            if (token != null && token.Token != null && String.IsNullOrEmpty(token.Token.Text) == false)
+            {
+                _isAtLineStart = false;
+            }
         }
 
 #if DEBUG
@@ -209,6 +232,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             _alignmentPointsForCurrentLine.Clear();
 #endif
             _scriptWriterElements.Add(_newLine);
+            _isAtLineStart = true;
         }
 
         private ScriptWriterElement FindOrCreateAlignmentPointData(AlignmentPoint ap)
@@ -237,10 +261,10 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
 
         private List<TSqlParserToken> Align()
         {
-            // keep all alignment points 
+            // keep all alignment points
             HashSet<AlignmentPointData> allPoints = new HashSet<AlignmentPointData>();
 
-            // find out the width for each alignment point and populate relationship among alignment points 
+            // find out the width for each alignment point and populate relationship among alignment points
 
             Int32 width = 0; // keep the width between two alignment points
             AlignmentPointData previousPoint = null;
@@ -316,7 +340,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
                     rightPoint.AlignAndRemoveLeftPoint(ap);
                 }
 
-                // ap is done; let's remove it; 
+                // ap is done; let's remove it;
                 allPoints.Remove(ap);
             }
 
@@ -413,5 +437,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
         }
 
         #endregion
+
+        private bool _isAtLineStart = true;
     }
 }

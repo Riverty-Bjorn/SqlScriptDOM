@@ -21,7 +21,15 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
             MarkClauseBodyAlignmentWhenNecessary(_options.NewLineBeforeOrderByClause, clauseBody);
 
             GenerateSpace();
-            GenerateCommaSeparatedList(node.OrderByElements);
+            PushAlignmentPoint(clauseBody);
+            try
+            {
+                GenerateCommaSeparatedList(node.OrderByElements);
+            }
+            finally
+            {
+                PopAlignmentPoint();
+            }
 
             PopAlignmentPoint();
         }
