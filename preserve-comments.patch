@@ -1,0 +1,1450 @@
+From 4d0a6cafb57a64f0d5c1be7eb07f45821dc7fa12 Mon Sep 17 00:00:00 2001
+From: Bjorn Nordblom <bjorn.nordblom@riverty.com>
+Date: Wed, 1 Apr 2026 11:31:50 +0200
+Subject: [PATCH] feat: preserve comments and blank lines in script generator
+
+- Add PreserveComments option to SqlScriptGeneratorOptions
+- Walk raw token stream between fragments to emit comments in-place
+- Preserve structural blank lines between statements and after GO
+- Fix GO batch separator spacing
+- Add comprehensive regression tests
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../SqlServer/ScriptGenerator/ScriptWriter.cs |  32 +-
+ .../SqlScriptGeneratorVisitor.Comments.cs     | 135 ++++--
+ ...SqlScriptGeneratorVisitor.CommonPhrases.cs |  12 +-
+ ...SqlScriptGeneratorVisitor.GroupByClause.cs |  12 +-
+ .../SqlScriptGeneratorVisitor.HavingClause.cs |  11 +-
+ ...SqlScriptGeneratorVisitor.OrderByClause.cs |  10 +-
+ ...SqlScriptGeneratorVisitor.StatementList.cs |  21 +-
+ .../SqlScriptGeneratorVisitor.TSqlBatch.cs    |  20 +-
+ .../SqlScriptGeneratorVisitor.TSqlScript.cs   |  15 +-
+ .../SqlScriptGeneratorVisitor.Utils.cs        |  16 +-
+ .../SqlScriptGeneratorVisitor.WhereClause.cs  |  21 +-
+ Test/SqlDom/ScriptGeneratorTests.cs           | 416 +++++++++++++-----
+ 12 files changed, 540 insertions(+), 181 deletions(-)
+
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/ScriptWriter.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/ScriptWriter.cs
+index e1ceb0e..5a64eef 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/ScriptWriter.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/ScriptWriter.cs
+@@ -32,6 +32,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         private Stack<Dictionary<String, AlignmentPoint>> _alignmentPointNameMaps; // Name to AlignmentPoints for the alignment points found after the nearest push
+         private List<ScriptWriterElement> _scriptWriterElements;
+         private Stack<AlignmentPoint> _newLineAlignmentPoints;
++        private bool _pendingLineBreakBeforeNextToken;
+ 
+         #endregion
+ 
+@@ -73,11 +74,23 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         public void AddToken(TSqlParserToken token)
+         {
+             ScriptGeneratorSupporter.CheckForNullReference(token, "token");
++
++            if (_pendingLineBreakBeforeNextToken && token.TokenType != TSqlTokenType.WhiteSpace)
++            {
++                NewLine();
++            }
++
+             AddTokenWrapper(new TokenWrapper(token));
+         }
+ 
++        public bool IsAtLineStart
++        {
++            get { return _isAtLineStart; }
++        }
++
+         public void NewLine()
+         {
++            _pendingLineBreakBeforeNextToken = false;
+             AddNewLine();
+ 
+             // if we have some AlignmentPoints on stack, we set to the top one
+@@ -92,6 +105,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             AddSpace(size);
+         }
+ 
++        public void RequestLineBreakBeforeNextToken()
++        {
++            _pendingLineBreakBeforeNextToken = true;
++        }
++
+         public void Mark(AlignmentPoint ap)
+         {
+             if (String.IsNullOrEmpty(ap.Name) == false &&
+@@ -185,6 +203,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         private void AddTokenWrapper(TokenWrapper token)
+         {
+             _scriptWriterElements.Add(token);
++
++            if (token != null && token.Token != null && String.IsNullOrEmpty(token.Token.Text) == false)
++            {
++                _isAtLineStart = false;
++            }
+         }
+ 
+ #if DEBUG
+@@ -209,6 +232,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             _alignmentPointsForCurrentLine.Clear();
+ #endif
+             _scriptWriterElements.Add(_newLine);
++            _isAtLineStart = true;
+         }
+ 
+         private ScriptWriterElement FindOrCreateAlignmentPointData(AlignmentPoint ap)
+@@ -237,10 +261,10 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+ 
+         private List<TSqlParserToken> Align()
+         {
+-            // keep all alignment points 
++            // keep all alignment points
+             HashSet<AlignmentPointData> allPoints = new HashSet<AlignmentPointData>();
+ 
+-            // find out the width for each alignment point and populate relationship among alignment points 
++            // find out the width for each alignment point and populate relationship among alignment points
+ 
+             Int32 width = 0; // keep the width between two alignment points
+             AlignmentPointData previousPoint = null;
+@@ -316,7 +340,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+                     rightPoint.AlignAndRemoveLeftPoint(ap);
+                 }
+ 
+-                // ap is done; let's remove it; 
++                // ap is done; let's remove it;
+                 allPoints.Remove(ap);
+             }
+ 
+@@ -413,5 +437,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         }
+ 
+         #endregion
++
++        private bool _isAtLineStart = true;
+     }
+ }
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Comments.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Comments.cs
+index 1ea9fec..ccd410f 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Comments.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Comments.cs
+@@ -26,7 +26,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         /// <summary>
+         /// Tracks which comment tokens have already been emitted to avoid duplicates.
+         /// </summary>
+-        private readonly HashSet<TSqlParserToken> _emittedComments = new HashSet<TSqlParserToken>();
++        private readonly HashSet<int> _emittedCommentIndexes = new HashSet<int>();
+ 
+         /// <summary>
+         /// Tracks whether leading (file-level) comments have been emitted.
+@@ -46,7 +46,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         {
+             _currentTokenStream = tokenStream;
+             _lastProcessedTokenIndex = -1;
+-            _emittedComments.Clear();
++            _emittedCommentIndexes.Clear();
+             _leadingCommentsEmitted = false;
+         }
+ 
+@@ -70,10 +70,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             for (int i = 0; i < fragment.FirstTokenIndex && i < _currentTokenStream.Count; i++)
+             {
+                 var token = _currentTokenStream[i];
+-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
++                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
+                 {
+                     EmitCommentToken(token, isLeading: true);
+-                    _emittedComments.Add(token);
++                    _emittedCommentIndexes.Add(i);
++                    _lastProcessedTokenIndex = i;
+                 }
+             }
+         }
+@@ -101,10 +102,10 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             for (int i = startIndex; i < endIndex && i < _currentTokenStream.Count; i++)
+             {
+                 var token = _currentTokenStream[i];
+-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
++                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
+                 {
+                     EmitCommentToken(token, isLeading: true);
+-                    _emittedComments.Add(token);
++                    _emittedCommentIndexes.Add(i);
+                     _lastProcessedTokenIndex = i;
+                 }
+             }
+@@ -131,11 +132,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             for (int i = lastTokenIndex + 1; i < _currentTokenStream.Count; i++)
+             {
+                 var token = _currentTokenStream[i];
+-                
+-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
++
++                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
+                 {
+-                    EmitCommentToken(token, isLeading: false);
+-                    _emittedComments.Add(token);
++                    EmitCommentToken(token, isLeading: ShouldEmitTrailingCommentAsLeading(lastTokenIndex + 1, i));
++                    _emittedCommentIndexes.Add(i);
+                     _lastProcessedTokenIndex = i;
+                 }
+                 else if (token.TokenType != TSqlTokenType.WhiteSpace)
+@@ -146,6 +147,63 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             }
+         }
+ 
++        private bool ShouldEmitTrailingCommentAsLeading(int startIndex, int commentIndex)
++        {
++            for (int i = startIndex; i < commentIndex && i < _currentTokenStream.Count; i++)
++            {
++                var token = _currentTokenStream[i];
++                if (token.TokenType == TSqlTokenType.WhiteSpace &&
++                    token.Text != null &&
++                    (token.Text.Contains("\r") || token.Text.Contains("\n")))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++
++        /// <summary>
++        /// Counts blank lines in whitespace tokens between two token-stream positions,
++        /// skipping batch separators (semicolons, GO) and stopping at the first comment
++        /// or other real token. Returns the number of blank lines beyond the
++        /// <paramref name="mandatoryNewlines"/> the caller already emits unconditionally.
++        /// </summary>
++        /// <param name="startExclusive">Token index after which scanning begins (exclusive).</param>
++        /// <param name="endExclusive">Token index at which scanning stops (exclusive).</param>
++        /// <param name="mandatoryNewlines">
++        /// Newlines the caller will emit regardless (subtracted from the raw count).
++        /// Use 1 for statement boundaries; use 2 for inter-batch gaps where the caller
++        /// emits a newline before and after GO.
++        /// </param>
++        protected int CountBlankLinesBetween(int startExclusive, int endExclusive, int mandatoryNewlines = 1)
++        {
++            if (_currentTokenStream == null)
++                return 0;
++
++            int newlineCount = 0;
++            for (int i = startExclusive + 1; i < endExclusive && i < _currentTokenStream.Count; i++)
++            {
++                var token = _currentTokenStream[i];
++                if (token.TokenType == TSqlTokenType.WhiteSpace && token.Text != null)
++                {
++                    foreach (char c in token.Text)
++                        if (c == '\n') newlineCount++;
++                }
++                else if (token.TokenType == TSqlTokenType.Semicolon ||
++                         token.TokenType == TSqlTokenType.Go)
++                {
++                    continue; // skip batch separators
++                }
++                else
++                {
++                    break; // stop at first comment or real code token
++                }
++            }
++
++            return Math.Max(0, newlineCount - mandatoryNewlines);
++        }
++
+         /// <summary>
+         /// Updates tracking after generating a fragment.
+         /// </summary>
+@@ -192,11 +250,32 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+                 return;
+             }
+ 
++            if (fragment is TSqlStatement)
++            {
++                UpdateLastProcessedIndex(fragment);
++                return;
++            }
++
+             // Emit trailing comments and update tracking
+             EmitTrailingComments(fragment);
+             UpdateLastProcessedIndex(fragment);
+         }
+ 
++        /// <summary>
++        /// Called after generating a statement terminator so trailing statement comments stay after it.
++        /// </summary>
++        /// <param name="statement">The statement that was just fully generated.</param>
++        protected void HandleCommentsAfterStatement(TSqlStatement statement)
++        {
++            if (!_options.PreserveComments || _currentTokenStream == null || statement == null)
++            {
++                return;
++            }
++
++            EmitTrailingComments(statement);
++            UpdateLastProcessedIndex(statement);
++        }
++
+         /// <summary>
+         /// Emits a comment token to the output.
+         /// </summary>
+@@ -209,35 +288,34 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+                 return;
+             }
+ 
+-            if (token.TokenType == TSqlTokenType.SingleLineComment)
++            if (isLeading && _writer.IsAtLineStart == false)
+             {
+-                if (!isLeading)
+-                {
+-                    // Trailing: add space before comment
+-                    _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
+-                }
++                _writer.NewLine();
++            }
++            else if (!isLeading && _writer.IsAtLineStart == false)
++            {
++                _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
++            }
+ 
++            if (token.TokenType == TSqlTokenType.SingleLineComment)
++            {
+                 _writer.AddToken(new TSqlParserToken(TSqlTokenType.SingleLineComment, token.Text));
+ 
+                 if (isLeading)
+                 {
+-                    // After a leading comment, add newline
+                     _writer.NewLine();
+                 }
++                else
++                {
++                    _writer.RequestLineBreakBeforeNextToken();
++                }
+             }
+             else if (token.TokenType == TSqlTokenType.MultilineComment)
+             {
+-                if (!isLeading)
+-                {
+-                    // Trailing: add space before comment
+-                    _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
+-                }
+-
+                 _writer.AddToken(new TSqlParserToken(TSqlTokenType.MultilineComment, token.Text));
+ 
+                 if (isLeading)
+                 {
+-                    // After a leading multi-line comment, add newline
+                     _writer.NewLine();
+                 }
+             }
+@@ -259,12 +337,11 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             for (int i = _lastProcessedTokenIndex + 1; i < _currentTokenStream.Count; i++)
+             {
+                 var token = _currentTokenStream[i];
+-                if (IsCommentToken(token) && !_emittedComments.Contains(token))
++                if (IsCommentToken(token) && !_emittedCommentIndexes.Contains(i))
+                 {
+-                    // End-of-script comments: add newline before, emit comment
+-                    _writer.NewLine();
+-                    _writer.AddToken(new TSqlParserToken(token.TokenType, token.Text));
+-                    _emittedComments.Add(token);
++                    EmitCommentToken(token, isLeading: true);
++                    _emittedCommentIndexes.Add(i);
++                    _lastProcessedTokenIndex = i;
+                 }
+             }
+         }
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.CommonPhrases.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.CommonPhrases.cs
+index f66d6fe..01ea5d2 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.CommonPhrases.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.CommonPhrases.cs
+@@ -426,18 +426,24 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             get;
+         }
+ 
+-        // some statements can be part of another statment, for example, SELECT statement can be 
++        // some statements can be part of another statment, for example, SELECT statement can be
+         // part of CREATE VIEW statement, and we don't want to generate semicolon for the included statements
+         protected Boolean _generateSemiColon = true;
+ 
+         protected void GenerateSemiColonWhenNecessary(TSqlStatement node)
+         {
+-            if (node != null &&
+-                _generateSemiColon &&
++            if (node == null)
++            {
++                return;
++            }
++
++            if (_generateSemiColon &&
+                 StatementsThatCannotHaveSemiColon.Contains(node.GetType()) == false)
+             {
+                 GenerateSymbol(TSqlTokenType.Semicolon);
+             }
++
++            HandleCommentsAfterStatement(node);
+         }
+ 
+         protected void GenerateCommaSeparatedWithClause<T>(IList<T> fragments, bool indent, bool includeParentheses) where T : TSqlFragment
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.GroupByClause.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.GroupByClause.cs
+index 389ebbc..971fa1b 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.GroupByClause.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.GroupByClause.cs
+@@ -25,11 +25,19 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             MarkClauseBodyAlignmentWhenNecessary(_options.NewLineBeforeGroupByClause, clauseBody);
+ 
+             GenerateSpace();
+-            GenerateCommaSeparatedList(node.GroupingSpecifications);
++            PushAlignmentPoint(clauseBody);
++            try
++            {
++                GenerateCommaSeparatedList(node.GroupingSpecifications);
++            }
++            finally
++            {
++                PopAlignmentPoint();
++            }
+ 
+             if (node.GroupByOption != GroupByOption.None)
+             {
+-                GenerateSpaceAndKeyword(TSqlTokenType.With); 
++                GenerateSpaceAndKeyword(TSqlTokenType.With);
+                 GenerateSpace();
+                 GroupByOptionHelper.Instance.GenerateSourceForOption(_writer, node.GroupByOption);
+             }
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.HavingClause.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.HavingClause.cs
+index bfc3bb3..d6f3656 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.HavingClause.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.HavingClause.cs
+@@ -19,7 +19,16 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             AlignmentPoint clauseBody = GetAlignmentPointForFragment(node, ClauseBody);
+             MarkClauseBodyAlignmentWhenNecessary(_options.NewLineBeforeHavingClause, clauseBody);
+ 
+-            GenerateSpaceAndFragmentIfNotNull(node.SearchCondition);
++            GenerateSpace();
++            PushAlignmentPoint(clauseBody);
++            try
++            {
++                GenerateFragmentIfNotNull(node.SearchCondition);
++            }
++            finally
++            {
++                PopAlignmentPoint();
++            }
+ 
+             PopAlignmentPoint();
+         }
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.OrderByClause.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.OrderByClause.cs
+index 9062718..fba2ee5 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.OrderByClause.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.OrderByClause.cs
+@@ -21,7 +21,15 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             MarkClauseBodyAlignmentWhenNecessary(_options.NewLineBeforeOrderByClause, clauseBody);
+ 
+             GenerateSpace();
+-            GenerateCommaSeparatedList(node.OrderByElements);
++            PushAlignmentPoint(clauseBody);
++            try
++            {
++                GenerateCommaSeparatedList(node.OrderByElements);
++            }
++            finally
++            {
++                PopAlignmentPoint();
++            }
+ 
+             PopAlignmentPoint();
+         }
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.StatementList.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.StatementList.cs
+index 6dedb21..a7688cb 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.StatementList.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.StatementList.cs
+@@ -14,19 +14,22 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         {
+             if (node.Statements != null)
+             {
+-                Boolean first = true;
+-                foreach (TSqlStatement statement in node.Statements)
++                for (int i = 0; i < node.Statements.Count; i++)
+                 {
+-                    if (first)
++                    TSqlStatement statement = node.Statements[i];
++                    if (i > 0)
+                     {
+-                        first = false;
+-                    }
+-                    else
+-                    {
+-                        for (var i = 0; i < _options.NumNewlinesAfterStatement; i++)
++                        int newlineCount;
++                        if (_options.PreserveComments && _currentTokenStream != null)
++                        {
++                            int blankLines = CountBlankLinesBetween(node.Statements[i - 1].LastTokenIndex, statement.FirstTokenIndex);
++                            newlineCount = 1 + Math.Min(blankLines, 3);
++                        }
++                        else
+                         {
+-                            NewLine();
++                            newlineCount = _options.NumNewlinesAfterStatement;
+                         }
++                        for (int n = 0; n < newlineCount; n++) NewLine();
+                     }
+ 
+                     GenerateFragmentIfNotNull(statement);
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlBatch.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlBatch.cs
+index e40318a..4f37f3c 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlBatch.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlBatch.cs
+@@ -3,6 +3,7 @@
+ //         Copyright (c) Microsoft Corporation.  All rights reserved.
+ // </copyright>
+ //------------------------------------------------------------------------------
++using System;
+ using Microsoft.SqlServer.TransactSql.ScriptDom;
+ 
+ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+@@ -11,16 +12,27 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+     {
+         public override void ExplicitVisit(TSqlBatch node)
+         {
+-            foreach (TSqlStatement statement in node.Statements)
++            for (int i = 0; i < node.Statements.Count; i++)
+             {
++                TSqlStatement statement = node.Statements[i];
+                 GenerateFragmentIfNotNull(statement);
+ 
+                 GenerateSemiColonWhenNecessary(statement);
+ 
+-                if (statement is TSqlStatementSnippet == false)
++                bool isLastStatementInBatch = i == node.Statements.Count - 1;
++                if (!isLastStatementInBatch && statement is TSqlStatementSnippet == false)
+                 {
+-                    NewLine();
+-                    NewLine();
++                    int newlineCount;
++                    if (_options.PreserveComments && _currentTokenStream != null)
++                    {
++                        int blankLines = CountBlankLinesBetween(statement.LastTokenIndex, node.Statements[i + 1].FirstTokenIndex);
++                        newlineCount = 1 + Math.Min(blankLines, 3); // 1 for line-break + preserved blank lines
++                    }
++                    else
++                    {
++                        newlineCount = 2; // default: one blank line
++                    }
++                    for (int n = 0; n < newlineCount; n++) NewLine();
+                 }
+             }
+         }
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlScript.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlScript.cs
+index 5f56850..42f2150 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlScript.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.TSqlScript.cs
+@@ -18,21 +18,24 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+                 SetTokenStreamForComments(node.ScriptTokenStream);
+             }
+ 
+-            Boolean firstItem = true;
++            TSqlBatch prevBatch = null;
+             foreach (var item in node.Batches)
+             {
+-                if (firstItem)
+-                {
+-                    firstItem = false;
+-                }
+-                else
++                if (prevBatch != null)
+                 {
+                     NewLine();
+                     GenerateKeyword(TSqlTokenType.Go);
+                     NewLine();
++
++                    if (_options.PreserveComments && _currentTokenStream != null)
++                    {
++                        int blanks = CountBlankLinesBetween(prevBatch.LastTokenIndex, item.FirstTokenIndex, mandatoryNewlines: 2);
++                        for (int b = 0; b < Math.Min(blanks, 3); b++) NewLine();
++                    }
+                 }
+ 
+                 GenerateFragmentIfNotNull(item);
++                prevBatch = item;
+             }
+ 
+             // Emit any remaining comments at end of script (after the last statement)
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Utils.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Utils.cs
+index 381c627..62d8d5c 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Utils.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.Utils.cs
+@@ -108,7 +108,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             }
+         }
+ 
+-        // generate Name = value 
++        // generate Name = value
+         protected void GenerateNameEqualsValue(String name, TSqlFragment value)
+         {
+             GenerateTokenAndEqualSign(name);
+@@ -122,7 +122,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             GenerateSpaceAndIdentifier(value);
+         }
+ 
+-        // generate Name = value 
++        // generate Name = value
+         protected void GenerateNameEqualsValue(TSqlTokenType keywordId, TSqlFragment value)
+         {
+             GenerateTokenAndEqualSign(keywordId);
+@@ -244,7 +244,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+                 else if (generateSpaces)
+                 {
+                     GenerateSpace();
+-                } 
++                }
+             });
+         }
+ 
+@@ -402,7 +402,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         {
+             GenerateAlignedParenthesizedOptionsWithMultipleIndent(list, 0);
+         }
+-        
++
+         private void GenerateSeparator(ListGenerationOption option)
+         {
+             switch (option.Separator)
+@@ -426,13 +426,13 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             }
+         }
+ 
+-        // generate a whitespace 
++        // generate a whitespace
+         protected void GenerateSpace()
+         {
+             _writer.AddToken(ScriptGeneratorSupporter.CreateWhitespaceToken(1));
+         }
+ 
+-        // generate a keyword 
++        // generate a keyword
+         protected void GenerateKeyword(TSqlTokenType keywordId)
+         {
+             _writer.AddKeyword(keywordId);
+@@ -473,7 +473,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+             GenerateSymbol(symbolId);
+         }
+ 
+-        // generate a symbol and a white space 
++        // generate a symbol and a white space
+         protected void GenerateSymbolAndSpace(TSqlTokenType symbolId)
+         {
+             GenerateSymbol(symbolId);
+@@ -519,7 +519,7 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+         }
+ 
+         // generate a comma-separated list for a value of a flag enum
+-        protected void GenerateCommaSeparatedFlagOpitons<TKey>(Dictionary<TKey, TokenGenerator> optionsGenerators, TKey options) 
++        protected void GenerateCommaSeparatedFlagOpitons<TKey>(Dictionary<TKey, TokenGenerator> optionsGenerators, TKey options)
+             where TKey : struct, IConvertible
+         {
+             Boolean first = true;
+diff --git a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.WhereClause.cs b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.WhereClause.cs
+index 1f5644c..e1abf5c 100644
+--- a/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.WhereClause.cs
++++ b/SqlScriptDom/ScriptDom/SqlServer/ScriptGenerator/SqlScriptGeneratorVisitor.WhereClause.cs
+@@ -22,13 +22,30 @@ namespace Microsoft.SqlServer.TransactSql.ScriptDom.ScriptGenerator
+ 
+             if (node.SearchCondition != null)
+             {
+-                GenerateSpaceAndFragmentIfNotNull(node.SearchCondition);
++                GenerateSpace();
++                PushAlignmentPoint(clauseBody);
++                try
++                {
++                    GenerateFragmentIfNotNull(node.SearchCondition);
++                }
++                finally
++                {
++                    PopAlignmentPoint();
++                }
+             }
+             else
+             {
+                 GenerateSpaceAndKeyword(TSqlTokenType.Current);
+                 GenerateSpaceAndKeyword(TSqlTokenType.Of);
+-                GenerateSpaceAndFragmentIfNotNull(node.Cursor);
++                PushAlignmentPoint(clauseBody);
++                try
++                {
++                    GenerateSpaceAndFragmentIfNotNull(node.Cursor);
++                }
++                finally
++                {
++                    PopAlignmentPoint();
++                }
+             }
+ 
+             PopAlignmentPoint();
+diff --git a/Test/SqlDom/ScriptGeneratorTests.cs b/Test/SqlDom/ScriptGeneratorTests.cs
+index 5a21409..cd25e81 100644
+--- a/Test/SqlDom/ScriptGeneratorTests.cs
++++ b/Test/SqlDom/ScriptGeneratorTests.cs
+@@ -159,6 +159,30 @@ namespace SqlStudio.Tests.UTSqlScriptDom
+             Assert.AreEqual(tableStatementString + Environment.NewLine + Environment.NewLine + tableStatementString, sql);
+         }
+ 
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestBatchesUseSingleSeparatorAroundGo()
++        {
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader("SELECT 1\r\nGO\r\nSELECT 2"), out var errors);
++
++            Assert.AreEqual(0, errors.Count);
++
++            var generatorOptions = new SqlScriptGeneratorOptions
++            {
++                PreserveComments = true
++            };
++            var generator = new Sql170ScriptGenerator(generatorOptions);
++            generator.GenerateScript(fragment, out var generatedSql);
++
++            var expected = "SELECT 1;" + Environment.NewLine +
++                           "GO" + Environment.NewLine +
++                           "SELECT 2;";
++
++            Assert.AreEqual(expected, generatedSql);
++        }
++
+         [TestMethod]
+         [Priority(0)]
+         [SqlStudioTestCategory(Category.UnitTest)]
+@@ -392,13 +416,13 @@ namespace SqlStudio.Tests.UTSqlScriptDom
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // With PreserveComments, the comment should appear in output
+-            Assert.IsTrue(generatedSql.Contains("-- This is a leading comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- This is a leading comment"),
+                 "Leading comment should be preserved when PreserveComments is true");
+-            
++
+             // Verify comment appears BEFORE the SELECT keyword (correct positioning)
+             int commentIndex = generatedSql.IndexOf("-- This is a leading comment");
+             int selectIndex = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+-            Assert.IsTrue(commentIndex < selectIndex, 
++            Assert.IsTrue(commentIndex < selectIndex,
+                 $"Leading comment should appear before SELECT. Comment at {commentIndex}, SELECT at {selectIndex}");
+         }
+ 
+@@ -422,14 +446,39 @@ namespace SqlStudio.Tests.UTSqlScriptDom
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // With PreserveComments, the trailing comment should appear
+-            Assert.IsTrue(generatedSql.Contains("-- trailing comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- trailing comment"),
+                 "Trailing comment should be preserved when PreserveComments is true");
+-            
++
+             // Verify trailing comment appears AFTER the SELECT (correct positioning)
+             int selectIndex = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+             int commentIndex = generatedSql.IndexOf("-- trailing comment");
+-            Assert.IsTrue(commentIndex > selectIndex, 
++            Assert.IsTrue(commentIndex > selectIndex,
+                 $"Trailing comment should appear after SELECT. SELECT at {selectIndex}, comment at {commentIndex}");
++            Assert.IsTrue(generatedSql.Contains("; -- trailing comment"),
++                $"Trailing comment should stay after the statement terminator. Actual output: {generatedSql}");
++        }
++
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestPreserveCommentsEnabled_BlockCommentAfterStatementStaysStandalone()
++        {
++            var sqlWithComments = "BEGIN\n/* BEGIN SCRIPTED INSERT 2017-11-29 */\nEXEC sp_myprocedure;\n/* END SCRIPTED INSERT */\nEND";
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader(sqlWithComments), out var errors);
++
++            Assert.AreEqual(0, errors.Count);
++
++            var generatorOptions = new SqlScriptGeneratorOptions
++            {
++                PreserveComments = true
++            };
++            var generator = new Sql170ScriptGenerator(generatorOptions);
++            generator.GenerateScript(fragment, out var generatedSql);
++
++            // Verify the end comment is on its own line (not appended to the execute statement)
++            Assert.IsTrue(generatedSql.Contains(Environment.NewLine + "    /* END SCRIPTED INSERT */"),
++                $"Standalone block comment should remain on its own line after the statement. Actual output: {generatedSql}");
+         }
+ 
+         [TestMethod]
+@@ -455,22 +504,22 @@ SELECT 2;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Both comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- First statement"), 
++            Assert.IsTrue(generatedSql.Contains("-- First statement"),
+                 "First comment should be preserved");
+-            Assert.IsTrue(generatedSql.Contains("-- Comment between statements"), 
++            Assert.IsTrue(generatedSql.Contains("-- Comment between statements"),
+                 "Comment between statements should be preserved");
+-            
++
+             // Verify ordering: first comment -> SELECT 1 -> between comment -> SELECT 2
+             int firstCommentIndex = generatedSql.IndexOf("-- First statement");
+             int firstSelectIndex = generatedSql.IndexOf("SELECT 1", StringComparison.OrdinalIgnoreCase);
+             int betweenCommentIndex = generatedSql.IndexOf("-- Comment between statements");
+             int secondSelectIndex = generatedSql.IndexOf("SELECT 2", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(firstCommentIndex < firstSelectIndex, 
++
++            Assert.IsTrue(firstCommentIndex < firstSelectIndex,
+                 "First comment should appear before first SELECT");
+-            Assert.IsTrue(firstSelectIndex < betweenCommentIndex, 
++            Assert.IsTrue(firstSelectIndex < betweenCommentIndex,
+                 "Between comment should appear after first SELECT");
+-            Assert.IsTrue(betweenCommentIndex < secondSelectIndex, 
++            Assert.IsTrue(betweenCommentIndex < secondSelectIndex,
+                 "Between comment should appear before second SELECT");
+         }
+ 
+@@ -494,13 +543,13 @@ SELECT 2;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // With PreserveComments, the multi-line comment should appear
+-            Assert.IsTrue(generatedSql.Contains("/* This is a multi-line comment */"), 
++            Assert.IsTrue(generatedSql.Contains("/* This is a multi-line comment */"),
+                 "Multi-line comment should be preserved when PreserveComments is true");
+-            
++
+             // Verify comment appears BEFORE the SELECT keyword (correct positioning)
+             int commentIndex = generatedSql.IndexOf("/* This is a multi-line comment */");
+             int selectIndex = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+-            Assert.IsTrue(commentIndex < selectIndex, 
++            Assert.IsTrue(commentIndex < selectIndex,
+                 $"Multi-line comment should appear before SELECT. Comment at {commentIndex}, SELECT at {selectIndex}");
+         }
+ 
+@@ -525,7 +574,7 @@ SELECT 1;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Decorative pattern should be preserved exactly
+-            Assert.IsTrue(generatedSql.Contains("/***** Header Comment *****/"), 
++            Assert.IsTrue(generatedSql.Contains("/***** Header Comment *****/"),
+                 "Decorative comment pattern should be preserved exactly");
+         }
+ 
+@@ -553,13 +602,13 @@ SELECT * FROM (
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Outer comment should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Outer query comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- Outer query comment"),
+                 "Outer query comment should be preserved");
+-            
++
+             // Verify comment appears BEFORE the SELECT keyword (correct positioning)
+             int commentIndex = generatedSql.IndexOf("-- Outer query comment");
+             int selectIndex = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+-            Assert.IsTrue(commentIndex < selectIndex, 
++            Assert.IsTrue(commentIndex < selectIndex,
+                 $"Outer query comment should appear before SELECT. Comment at {commentIndex}, SELECT at {selectIndex}");
+         }
+ 
+@@ -588,13 +637,13 @@ SELECT * FROM cte;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // CTE comment should be preserved AND appear before the WITH keyword
+-            Assert.IsTrue(generatedSql.Contains("-- CTE definition comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- CTE definition comment"),
+                 "CTE definition comment should be preserved");
+-            
++
+             // Verify comment appears BEFORE the WITH keyword (correct positioning)
+             int commentIndex = generatedSql.IndexOf("-- CTE definition comment");
+             int withIndex = generatedSql.IndexOf("WITH", StringComparison.OrdinalIgnoreCase);
+-            Assert.IsTrue(commentIndex < withIndex, 
++            Assert.IsTrue(commentIndex < withIndex,
+                 $"CTE comment should appear before WITH keyword. Comment at {commentIndex}, WITH at {withIndex}");
+         }
+ 
+@@ -621,13 +670,13 @@ SELECT a, b FROM source_table;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Insert comment should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Insert with select comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- Insert with select comment"),
+                 "Insert statement comment should be preserved");
+-            
++
+             // Verify comment appears BEFORE the INSERT keyword (correct positioning)
+             int commentIndex = generatedSql.IndexOf("-- Insert with select comment");
+             int insertIndex = generatedSql.IndexOf("INSERT", StringComparison.OrdinalIgnoreCase);
+-            Assert.IsTrue(commentIndex < insertIndex, 
++            Assert.IsTrue(commentIndex < insertIndex,
+                 $"Insert comment should appear before INSERT. Comment at {commentIndex}, INSERT at {insertIndex}");
+         }
+ 
+@@ -659,16 +708,68 @@ END;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Procedure header comment should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Procedure header comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- Procedure header comment"),
+                 "Procedure header comment should be preserved");
+-            
++
+             // Verify comment appears BEFORE the CREATE keyword (correct positioning)
+             int commentIndex = generatedSql.IndexOf("-- Procedure header comment");
+             int createIndex = generatedSql.IndexOf("CREATE", StringComparison.OrdinalIgnoreCase);
+-            Assert.IsTrue(commentIndex < createIndex, 
++            Assert.IsTrue(commentIndex < createIndex,
+                 $"Procedure comment should appear before CREATE. Comment at {commentIndex}, CREATE at {createIndex}");
+         }
+ 
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestPreserveCommentsEnabled_LeadingCommentInsideBeginEndIsIndented()
++        {
++            var sqlWithComments = @"CREATE PROCEDURE TestProc
++AS
++BEGIN
++    -- Comment before statement
++    SELECT 1;
++END;";
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader(sqlWithComments), out var errors);
++
++            Assert.AreEqual(0, errors.Count);
++
++            var generatorOptions = new SqlScriptGeneratorOptions
++            {
++                PreserveComments = true
++            };
++            var generator = new Sql170ScriptGenerator(generatorOptions);
++            generator.GenerateScript(fragment, out var generatedSql);
++
++            StringAssert.Contains(generatedSql, "    -- Comment before statement");
++        }
++
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestPreserveCommentsEnabled_LeadingCommentInWherePredicatesIsIndented()
++        {
++            var sqlWithComments = @"SELECT *
++FROM orders
++WHERE
++    -- Filter by active status
++    status = 'active'
++    AND amount > 100;";
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader(sqlWithComments), out var errors);
++
++            Assert.AreEqual(0, errors.Count);
++
++            var generatorOptions = new SqlScriptGeneratorOptions
++            {
++                PreserveComments = true
++            };
++            var generator = new Sql170ScriptGenerator(generatorOptions);
++            generator.GenerateScript(fragment, out var generatedSql);
++
++            StringAssert.Contains(generatedSql, "    -- Filter by active status");
++        }
++
+         [TestMethod]
+         [Priority(0)]
+         [SqlStudioTestCategory(Category.UnitTest)]
+@@ -691,19 +792,19 @@ SELECT 1; /* inline block */ -- trailing single";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Both comment styles should be preserved
+-            Assert.IsTrue(generatedSql.Contains("/* Block comment at start */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Block comment at start */"),
+                 "Block comment should be preserved");
+-            Assert.IsTrue(generatedSql.Contains("-- Single line after block"), 
++            Assert.IsTrue(generatedSql.Contains("-- Single line after block"),
+                 "Single line comment should be preserved");
+-            
++
+             // Verify ordering: block comment -> single line comment -> SELECT
+             int blockCommentIndex = generatedSql.IndexOf("/* Block comment at start */");
+             int singleLineIndex = generatedSql.IndexOf("-- Single line after block");
+             int selectIndex = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(blockCommentIndex < singleLineIndex, 
++
++            Assert.IsTrue(blockCommentIndex < singleLineIndex,
+                 "Block comment should appear before single-line comment");
+-            Assert.IsTrue(singleLineIndex < selectIndex, 
++            Assert.IsTrue(singleLineIndex < selectIndex,
+                 "Single-line comment should appear before SELECT");
+         }
+ 
+@@ -733,13 +834,13 @@ CREATE TABLE TestTable (
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Table creation comment should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Table creation comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- Table creation comment"),
+                 "Table creation comment should be preserved");
+-            
++
+             // Verify comment appears BEFORE the CREATE keyword (correct positioning)
+             int commentIndex = generatedSql.IndexOf("-- Table creation comment");
+             int createIndex = generatedSql.IndexOf("CREATE", StringComparison.OrdinalIgnoreCase);
+-            Assert.IsTrue(commentIndex < createIndex, 
++            Assert.IsTrue(commentIndex < createIndex,
+                 $"Table comment should appear before CREATE. Comment at {commentIndex}, CREATE at {createIndex}");
+         }
+ 
+@@ -765,13 +866,13 @@ CREATE TABLE TestTable (
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // End-of-script comment should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- End of script comment"), 
++            Assert.IsTrue(generatedSql.Contains("-- End of script comment"),
+                 "End-of-script comment should be preserved. Actual output: " + generatedSql);
+-            
++
+             // Verify comment appears AFTER the SELECT (correct positioning)
+             int selectIndex = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+             int commentIndex = generatedSql.IndexOf("-- End of script comment");
+-            Assert.IsTrue(commentIndex > selectIndex, 
++            Assert.IsTrue(commentIndex > selectIndex,
+                 $"End-of-script comment should appear after SELECT. SELECT at {selectIndex}, comment at {commentIndex}");
+         }
+ 
+@@ -797,15 +898,15 @@ CREATE TABLE TestTable (
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // End-of-script multi-line comment should be preserved
+-            Assert.IsTrue(generatedSql.Contains("/* End of script"), 
++            Assert.IsTrue(generatedSql.Contains("/* End of script"),
+                 "End-of-script multi-line comment should be preserved. Actual output: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("multi-line comment */"), 
++            Assert.IsTrue(generatedSql.Contains("multi-line comment */"),
+                 "End-of-script multi-line comment should be complete");
+-            
++
+             // Verify comment appears AFTER the SELECT
+             int selectIndex = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+             int commentIndex = generatedSql.IndexOf("/* End of script");
+-            Assert.IsTrue(commentIndex > selectIndex, 
++            Assert.IsTrue(commentIndex > selectIndex,
+                 $"End-of-script comment should appear after SELECT. SELECT at {selectIndex}, comment at {commentIndex}");
+         }
+ 
+@@ -832,7 +933,7 @@ WHERE /* filter active users */ status = 'active';";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Comment in WHERE clause should be preserved
+-            Assert.IsTrue(generatedSql.Contains("/* filter active users */"), 
++            Assert.IsTrue(generatedSql.Contains("/* filter active users */"),
+                 "Comment in WHERE clause should be preserved. Actual output: " + generatedSql);
+         }
+ 
+@@ -842,7 +943,7 @@ WHERE /* filter active users */ status = 'active';";
+         public void TestPreserveCommentsEnabled_CommentInSelectList()
+         {
+             // Test comments within SELECT list (between columns)
+-            var sqlWithComments = @"SELECT 
++            var sqlWithComments = @"SELECT
+     id, -- primary key
+     name, -- user name
+     email -- contact info
+@@ -861,9 +962,9 @@ FROM users;";
+ 
+             // At least one of the column comments should be preserved
+             Assert.IsTrue(
+-                generatedSql.Contains("-- primary key") || 
++                generatedSql.Contains("-- primary key") ||
+                 generatedSql.Contains("-- user name") ||
+-                generatedSql.Contains("-- contact info"), 
++                generatedSql.Contains("-- contact info"),
+                 "At least one column comment should be preserved. Actual output: " + generatedSql);
+         }
+ 
+@@ -896,15 +997,15 @@ FROM users;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Column definition comments should be preserved and in correct positions
+-            Assert.IsTrue(generatedSql.Contains("-- Primary key column"), 
++            Assert.IsTrue(generatedSql.Contains("-- Primary key column"),
+                 "Primary key column comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("-- User's full name"), 
++            Assert.IsTrue(generatedSql.Contains("-- User's full name"),
+                 "FullName column comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Email address for notifications */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Email address for notifications */"),
+                 "Email column block comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("-- Timestamp for auditing"), 
++            Assert.IsTrue(generatedSql.Contains("-- Timestamp for auditing"),
+                 "CreatedDate column comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: comments should appear before their respective columns
+             int pkCommentIdx = generatedSql.IndexOf("-- Primary key column");
+             int idColumnIdx = generatedSql.IndexOf("Id", StringComparison.OrdinalIgnoreCase);
+@@ -912,12 +1013,12 @@ FROM users;";
+             int fullNameColumnIdx = generatedSql.IndexOf("FullName", StringComparison.OrdinalIgnoreCase);
+             int emailCommentIdx = generatedSql.IndexOf("/* Email address for notifications */");
+             int emailColumnIdx = generatedSql.IndexOf("Email", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(pkCommentIdx < idColumnIdx, 
++
++            Assert.IsTrue(pkCommentIdx < idColumnIdx,
+                 $"Primary key comment should appear before Id column. Comment at {pkCommentIdx}, Id at {idColumnIdx}");
+-            Assert.IsTrue(nameCommentIdx < fullNameColumnIdx, 
++            Assert.IsTrue(nameCommentIdx < fullNameColumnIdx,
+                 $"FullName comment should appear before FullName column. Comment at {nameCommentIdx}, FullName at {fullNameColumnIdx}");
+-            Assert.IsTrue(emailCommentIdx < emailColumnIdx, 
++            Assert.IsTrue(emailCommentIdx < emailColumnIdx,
+                 $"Email comment should appear before Email column. Comment at {emailCommentIdx}, Email at {emailColumnIdx}");
+         }
+ 
+@@ -927,8 +1028,8 @@ FROM users;";
+         public void TestPreserveCommentsEnabled_CommentInCaseExpression()
+         {
+             // Test comments within CASE expressions
+-            var sqlWithComments = @"SELECT 
+-    CASE 
++            var sqlWithComments = @"SELECT
++    CASE
+         -- Check for high priority
+         WHEN priority = 1 THEN 'High'
+         /* Medium priority items */
+@@ -950,13 +1051,13 @@ FROM tasks;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // CASE expression comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Check for high priority"), 
++            Assert.IsTrue(generatedSql.Contains("-- Check for high priority"),
+                 "High priority WHEN comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Medium priority items */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Medium priority items */"),
+                 "Medium priority block comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("-- Default to low priority"), 
++            Assert.IsTrue(generatedSql.Contains("-- Default to low priority"),
+                 "ELSE comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: comments should appear before their respective WHEN/ELSE clauses
+             int highPriorityCommentIdx = generatedSql.IndexOf("-- Check for high priority");
+             int firstWhenIdx = generatedSql.IndexOf("WHEN", StringComparison.OrdinalIgnoreCase);
+@@ -964,12 +1065,12 @@ FROM tasks;";
+             int secondWhenIdx = generatedSql.IndexOf("WHEN", firstWhenIdx + 1, StringComparison.OrdinalIgnoreCase);
+             int elseCommentIdx = generatedSql.IndexOf("-- Default to low priority");
+             int elseIdx = generatedSql.IndexOf("ELSE", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(highPriorityCommentIdx < firstWhenIdx, 
++
++            Assert.IsTrue(highPriorityCommentIdx < firstWhenIdx,
+                 $"High priority comment should appear before first WHEN. Comment at {highPriorityCommentIdx}, WHEN at {firstWhenIdx}");
+-            Assert.IsTrue(mediumCommentIdx < secondWhenIdx, 
++            Assert.IsTrue(mediumCommentIdx < secondWhenIdx,
+                 $"Medium priority comment should appear before second WHEN. Comment at {mediumCommentIdx}, WHEN at {secondWhenIdx}");
+-            Assert.IsTrue(elseCommentIdx < elseIdx, 
++            Assert.IsTrue(elseCommentIdx < elseIdx,
+                 $"ELSE comment should appear before ELSE. Comment at {elseCommentIdx}, ELSE at {elseIdx}");
+         }
+ 
+@@ -1000,13 +1101,13 @@ CROSS JOIN products p;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // JOIN clause comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Join to get user orders"), 
++            Assert.IsTrue(generatedSql.Contains("-- Join to get user orders"),
+                 "INNER JOIN comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Left join for optional address */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Left join for optional address */"),
+                 "LEFT JOIN block comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("-- Cross join for all combinations"), 
++            Assert.IsTrue(generatedSql.Contains("-- Cross join for all combinations"),
+                 "CROSS JOIN comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: comments should appear before their respective JOIN clauses
+             int innerJoinCommentIdx = generatedSql.IndexOf("-- Join to get user orders");
+             int innerJoinIdx = generatedSql.IndexOf("INNER JOIN", StringComparison.OrdinalIgnoreCase);
+@@ -1014,12 +1115,12 @@ CROSS JOIN products p;";
+             int leftJoinIdx = generatedSql.IndexOf("LEFT", StringComparison.OrdinalIgnoreCase);
+             int crossJoinCommentIdx = generatedSql.IndexOf("-- Cross join for all combinations");
+             int crossJoinIdx = generatedSql.IndexOf("CROSS JOIN", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(innerJoinCommentIdx < innerJoinIdx, 
++
++            Assert.IsTrue(innerJoinCommentIdx < innerJoinIdx,
+                 $"INNER JOIN comment should appear before INNER JOIN. Comment at {innerJoinCommentIdx}, JOIN at {innerJoinIdx}");
+-            Assert.IsTrue(leftJoinCommentIdx < leftJoinIdx, 
++            Assert.IsTrue(leftJoinCommentIdx < leftJoinIdx,
+                 $"LEFT JOIN comment should appear before LEFT JOIN. Comment at {leftJoinCommentIdx}, JOIN at {leftJoinIdx}");
+-            Assert.IsTrue(crossJoinCommentIdx < crossJoinIdx, 
++            Assert.IsTrue(crossJoinCommentIdx < crossJoinIdx,
+                 $"CROSS JOIN comment should appear before CROSS JOIN. Comment at {crossJoinCommentIdx}, JOIN at {crossJoinIdx}");
+         }
+ 
+@@ -1030,7 +1131,7 @@ CROSS JOIN products p;";
+         {
+             // Test comments within WHERE clause predicates
+             var sqlWithComments = @"SELECT * FROM orders
+-WHERE 
++WHERE
+     -- Filter by active status
+     status = 'active'
+     /* Date range filter */
+@@ -1052,15 +1153,15 @@ WHERE
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // WHERE predicate comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Filter by active status"), 
++            Assert.IsTrue(generatedSql.Contains("-- Filter by active status"),
+                 "Status filter comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Date range filter */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Date range filter */"),
+                 "Date range block comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("-- Exclude test orders"), 
++            Assert.IsTrue(generatedSql.Contains("-- Exclude test orders"),
+                 "Test orders exclusion comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("-- Amount threshold"), 
++            Assert.IsTrue(generatedSql.Contains("-- Amount threshold"),
+                 "Amount threshold comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: comments should appear before their respective predicates
+             int statusCommentIdx = generatedSql.IndexOf("-- Filter by active status");
+             int statusPredicateIdx = generatedSql.IndexOf("status", StringComparison.OrdinalIgnoreCase);
+@@ -1070,14 +1171,14 @@ WHERE
+             int testPredicateIdx = generatedSql.IndexOf("is_test", StringComparison.OrdinalIgnoreCase);
+             int amountCommentIdx = generatedSql.IndexOf("-- Amount threshold");
+             int amountPredicateIdx = generatedSql.IndexOf("amount", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(statusCommentIdx < statusPredicateIdx, 
++
++            Assert.IsTrue(statusCommentIdx < statusPredicateIdx,
+                 $"Status comment should appear before status predicate. Comment at {statusCommentIdx}, predicate at {statusPredicateIdx}");
+-            Assert.IsTrue(dateCommentIdx < datePredicateIdx, 
++            Assert.IsTrue(dateCommentIdx < datePredicateIdx,
+                 $"Date comment should appear before order_date predicate. Comment at {dateCommentIdx}, predicate at {datePredicateIdx}");
+-            Assert.IsTrue(testCommentIdx < testPredicateIdx, 
++            Assert.IsTrue(testCommentIdx < testPredicateIdx,
+                 $"Test orders comment should appear before is_test predicate. Comment at {testCommentIdx}, predicate at {testPredicateIdx}");
+-            Assert.IsTrue(amountCommentIdx < amountPredicateIdx, 
++            Assert.IsTrue(amountCommentIdx < amountPredicateIdx,
+                 $"Amount comment should appear before amount predicate. Comment at {amountCommentIdx}, predicate at {amountPredicateIdx}");
+         }
+ 
+@@ -1106,20 +1207,20 @@ HAVING COUNT(*) > 5;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // GROUP BY and HAVING comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Group by department"), 
++            Assert.IsTrue(generatedSql.Contains("-- Group by department"),
+                 "GROUP BY comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Filter groups with more than 5 employees */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Filter groups with more than 5 employees */"),
+                 "HAVING block comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: comments should appear before their respective clauses
+             int groupByCommentIdx = generatedSql.IndexOf("-- Group by department");
+             int groupByIdx = generatedSql.IndexOf("GROUP BY", StringComparison.OrdinalIgnoreCase);
+             int havingCommentIdx = generatedSql.IndexOf("/* Filter groups with more than 5 employees */");
+             int havingIdx = generatedSql.IndexOf("HAVING", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(groupByCommentIdx < groupByIdx, 
++
++            Assert.IsTrue(groupByCommentIdx < groupByIdx,
+                 $"GROUP BY comment should appear before GROUP BY. Comment at {groupByCommentIdx}, GROUP BY at {groupByIdx}");
+-            Assert.IsTrue(havingCommentIdx < havingIdx, 
++            Assert.IsTrue(havingCommentIdx < havingIdx,
+                 $"HAVING comment should appear before HAVING. Comment at {havingCommentIdx}, HAVING at {havingIdx}");
+         }
+ 
+@@ -1131,7 +1232,7 @@ HAVING COUNT(*) > 5;";
+             // Test comments in ORDER BY clause
+             var sqlWithComments = @"SELECT name, created_date, priority
+ FROM tasks
+-ORDER BY 
++ORDER BY
+     -- Primary sort: highest priority first
+     priority ASC,
+     /* Secondary sort: newest first */
+@@ -1149,11 +1250,11 @@ ORDER BY
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // ORDER BY comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Primary sort: highest priority first"), 
++            Assert.IsTrue(generatedSql.Contains("-- Primary sort: highest priority first"),
+                 "Primary sort comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Secondary sort: newest first */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Secondary sort: newest first */"),
+                 "Secondary sort block comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: comments should appear before their respective sort columns
+             int primarySortCommentIdx = generatedSql.IndexOf("-- Primary sort: highest priority first");
+             int orderByIdx = generatedSql.IndexOf("ORDER BY", StringComparison.OrdinalIgnoreCase);
+@@ -1162,10 +1263,10 @@ ORDER BY
+             int secondarySortCommentIdx = generatedSql.IndexOf("/* Secondary sort: newest first */");
+             // Find created_date AFTER ORDER BY (since it also appears in SELECT list)
+             int createdDateInOrderByIdx = generatedSql.IndexOf("created_date", orderByIdx, StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(primarySortCommentIdx > orderByIdx && primarySortCommentIdx < priorityInOrderByIdx, 
++
++            Assert.IsTrue(primarySortCommentIdx > orderByIdx && primarySortCommentIdx < priorityInOrderByIdx,
+                 $"Primary sort comment should appear between ORDER BY and priority. ORDER BY at {orderByIdx}, Comment at {primarySortCommentIdx}, priority at {priorityInOrderByIdx}");
+-            Assert.IsTrue(secondarySortCommentIdx < createdDateInOrderByIdx, 
++            Assert.IsTrue(secondarySortCommentIdx < createdDateInOrderByIdx,
+                 $"Secondary sort comment should appear before created_date column. Comment at {secondarySortCommentIdx}, created_date at {createdDateInOrderByIdx}");
+         }
+ 
+@@ -1194,20 +1295,20 @@ SELECT id, name FROM archived_users;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // UNION query comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- First query: active users"), 
++            Assert.IsTrue(generatedSql.Contains("-- First query: active users"),
+                 "First query comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Combine with archived users */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Combine with archived users */"),
+                 "UNION block comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: comments should appear at correct positions relative to queries
+             int firstQueryCommentIdx = generatedSql.IndexOf("-- First query: active users");
+             int firstSelectIdx = generatedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+             int unionCommentIdx = generatedSql.IndexOf("/* Combine with archived users */");
+             int unionIdx = generatedSql.IndexOf("UNION", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(firstQueryCommentIdx < firstSelectIdx, 
++
++            Assert.IsTrue(firstQueryCommentIdx < firstSelectIdx,
+                 $"First query comment should appear before first SELECT. Comment at {firstQueryCommentIdx}, SELECT at {firstSelectIdx}");
+-            Assert.IsTrue(unionCommentIdx < unionIdx, 
++            Assert.IsTrue(unionCommentIdx < unionIdx,
+                 $"UNION comment should appear before UNION. Comment at {unionCommentIdx}, UNION at {unionIdx}");
+         }
+ 
+@@ -1237,25 +1338,114 @@ SELECT id, name FROM archived_users;";
+             generator.GenerateScript(fragment, out var generatedSql);
+ 
+             // Nested subquery comments should be preserved
+-            Assert.IsTrue(generatedSql.Contains("-- Outer subquery"), 
++            Assert.IsTrue(generatedSql.Contains("-- Outer subquery"),
+                 "Outer subquery comment should be preserved. Actual: " + generatedSql);
+-            Assert.IsTrue(generatedSql.Contains("/* Inner subquery */"), 
++            Assert.IsTrue(generatedSql.Contains("/* Inner subquery */"),
+                 "Inner subquery block comment should be preserved. Actual: " + generatedSql);
+-            
++
+             // Verify position: outer comment before inner comment (based on nesting order)
+             int outerCommentIdx = generatedSql.IndexOf("-- Outer subquery");
+             int innerCommentIdx = generatedSql.IndexOf("/* Inner subquery */");
+             int innerQAliasIdx = generatedSql.IndexOf("inner_q", StringComparison.OrdinalIgnoreCase);
+             int outerQAliasIdx = generatedSql.IndexOf("outer_q", StringComparison.OrdinalIgnoreCase);
+-            
+-            Assert.IsTrue(outerCommentIdx < innerCommentIdx, 
++
++            Assert.IsTrue(outerCommentIdx < innerCommentIdx,
+                 $"Outer subquery comment should appear before inner subquery comment. Outer at {outerCommentIdx}, inner at {innerCommentIdx}");
+-            Assert.IsTrue(innerCommentIdx < innerQAliasIdx, 
++            Assert.IsTrue(innerCommentIdx < innerQAliasIdx,
+                 $"Inner subquery comment should appear before inner_q alias. Comment at {innerCommentIdx}, alias at {innerQAliasIdx}");
+-            Assert.IsTrue(innerQAliasIdx < outerQAliasIdx, 
++            Assert.IsTrue(innerQAliasIdx < outerQAliasIdx,
+                 $"inner_q alias should appear before outer_q alias. inner_q at {innerQAliasIdx}, outer_q at {outerQAliasIdx}");
+         }
+ 
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestPreserveCommentsEnabled_BlankLinesBetweenStatements()
++        {
++            // Two blank lines between statements should be preserved
++            var sql = "SELECT 1;\n\n\nSELECT 2;";
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader(sql), out var errors);
++            Assert.AreEqual(0, errors.Count);
++
++            var opts = new SqlScriptGeneratorOptions { PreserveComments = true };
++            var gen = new Sql170ScriptGenerator(opts);
++            gen.GenerateScript(fragment, out var result);
++
++            // Should have two blank lines between the two SELECT statements
++            int first = result.IndexOf("SELECT 1", StringComparison.OrdinalIgnoreCase);
++            int second = result.IndexOf("SELECT 2", StringComparison.OrdinalIgnoreCase);
++            string between = result.Substring(first + "SELECT 1".Length, second - first - "SELECT 1".Length);
++            int newlineCount = between.Split('\n').Length - 1;
++            Assert.IsTrue(newlineCount >= 3, $"Expected >=3 newlines (2 blank lines) between statements, got {newlineCount}. Between='{between}'");
++        }
++
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestPreserveCommentsEnabled_NoExtraBlankLinesWhenOriginalHasNone()
++        {
++            // No blank line between statements should produce just a single line-break
++            var sql = "SELECT 1;\nSELECT 2;";
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader(sql), out var errors);
++            Assert.AreEqual(0, errors.Count);
++
++            var opts = new SqlScriptGeneratorOptions { PreserveComments = true };
++            var gen = new Sql170ScriptGenerator(opts);
++            gen.GenerateScript(fragment, out var result);
++
++            int first = result.IndexOf("SELECT 1", StringComparison.OrdinalIgnoreCase);
++            int second = result.IndexOf("SELECT 2", StringComparison.OrdinalIgnoreCase);
++            string between = result.Substring(first + "SELECT 1".Length, second - first - "SELECT 1".Length);
++            int newlineCount = between.Split('\n').Length - 1;
++            Assert.IsTrue(newlineCount <= 2, $"Expected <=2 newlines (0-1 blank lines) between statements, got {newlineCount}. Between='{between}'");
++        }
++
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestPreserveCommentsEnabled_BlankLinesInsideBeginEnd()
++        {
++            // Blank lines inside a BEGIN/END block should be preserved
++            var sql = "BEGIN\n    SELECT 1;\n\n\n    SELECT 2;\nEND;";
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader(sql), out var errors);
++            Assert.AreEqual(0, errors.Count);
++
++            var opts = new SqlScriptGeneratorOptions { PreserveComments = true };
++            var gen = new Sql170ScriptGenerator(opts);
++            gen.GenerateScript(fragment, out var result);
++
++            int first = result.IndexOf("SELECT 1", StringComparison.OrdinalIgnoreCase);
++            int second = result.IndexOf("SELECT 2", StringComparison.OrdinalIgnoreCase);
++            string between = result.Substring(first + "SELECT 1".Length, second - first - "SELECT 1".Length);
++            int newlineCount = between.Split('\n').Length - 1;
++            Assert.IsTrue(newlineCount >= 3, $"Expected >=3 newlines (2 blank lines) in BEGIN/END body, got {newlineCount}. Between='{between}'");
++        }
++
++        [TestMethod]
++        [Priority(0)]
++        [SqlStudioTestCategory(Category.UnitTest)]
++        public void TestPreserveCommentsEnabled_BlankLinesAfterGo()
++        {
++            // Blank lines after GO should be preserved
++            var sql = "SELECT 1;\nGO\n\n\nSELECT 2;";
++            var parser = new TSql170Parser(true);
++            var fragment = parser.Parse(new StringReader(sql), out var errors);
++            Assert.AreEqual(0, errors.Count);
++
++            var opts = new SqlScriptGeneratorOptions { PreserveComments = true };
++            var gen = new Sql170ScriptGenerator(opts);
++            gen.GenerateScript(fragment, out var result);
++
++            int goIdx = result.IndexOf("GO", StringComparison.OrdinalIgnoreCase);
++            int second = result.IndexOf("SELECT 2", StringComparison.OrdinalIgnoreCase);
++            string afterGo = result.Substring(goIdx + 2, second - goIdx - 2);
++            int newlineCount = afterGo.Split('\n').Length - 1;
++            Assert.IsTrue(newlineCount >= 3, $"Expected >=3 newlines after GO, got {newlineCount}. AfterGo='{afterGo}'");
++        }
++
+         #endregion
+     }
+ }
+-- 
+2.53.0.windows.1
+
