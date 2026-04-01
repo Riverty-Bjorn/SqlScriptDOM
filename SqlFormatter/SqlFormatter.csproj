@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SqlScriptDom.Formatter</RootNamespace>
+    <AssemblyName>SqlScriptDom.Formatter</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Opt out of strong-name signing used by the parent ScriptDOM project -->
+    <SignAssembly>false</SignAssembly>
+    <DelaySign>false</DelaySign>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SqlScriptDom\Microsoft.SqlServer.TransactSql.ScriptDom.csproj" />
+  </ItemGroup>
+
+</Project>

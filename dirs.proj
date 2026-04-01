@@ -4,6 +4,7 @@
          build as they are referenced by Microsoft.SqlServer.TransactSql.ScriptDom.csproj
     -->
     <ProjectReference Include="SqlScriptDom\Microsoft.SqlServer.TransactSql.ScriptDom.csproj" />
+    <ProjectReference Include="SqlFormatter\SqlFormatter.csproj" />
     <ProjectReference Include="Test\SqlDom\UTSqlScriptDom.csproj" />
   </ItemGroup>
 </Project>
